@@ -1,0 +1,19 @@
+{
+  "server": {
+    "domain": "t.example.com",
+    "domain_alias": [],
+    "domains_file": "",
+    "listen_host": "0.0.0.0",
+    "listen_port": 53,
+    "upstream_host": "127.0.0.1",
+    "upstream_port": 80,
+    "upstream_proto": "tcp",
+    "upload_mtu": 220,
+    "download_mtu": 512,
+    "query_size": 220,
+    "max_sessions": 100,
+    "query_types": "NS,TXT,CNAME,MX,SRV",
+    "setup": false,
+    "setup_output": "undead_client_import.json"
+  }
+}

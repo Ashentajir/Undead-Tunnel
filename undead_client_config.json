@@ -1,0 +1,24 @@
+{
+  "client": {
+    "domain": "t.example.com",
+    "resolver": [
+      "1.1.1.1:53",
+      "8.8.8.8:53"
+    ],
+    "resolvers_file": "",
+    "upload_mtu": 220,
+    "download_mtu": 512,
+    "query_size": 220,
+    "parallel_resolvers": 20,
+    "channels": 8,
+    "duplication": 1,
+    "setup_duplication": 2,
+    "query_timeout": 2.0,
+    "check_transport": true,
+    "proxy_mode": "socks",
+    "proxy_host": "127.0.0.1",
+    "proxy_port": 1080,
+    "data": "GET / HTTP/1.1\\r\\nHost: test\\r\\n\\r\\n",
+    "import_config": ""
+  }
+}

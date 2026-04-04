@@ -15,6 +15,8 @@ import struct
 import hashlib
 import base64
 import secrets
+import zlib
+import hmac
 from typing import List
 
 
@@ -65,6 +67,82 @@ def _xor32(data: bytes, key_stream: bytes, block_offset: int = 0) -> bytes:
     return bytes(out)
 
 
+def _xor_bytes(data: bytes, stream: bytes) -> bytes:
+    return bytes(a ^ b for a, b in zip(data, stream))
+
+
+def _expand_stream(key: bytes, nonce: bytes, length: int) -> bytes:
+    out = b""
+    ctr = 0
+    while len(out) < length:
+        out += hashlib.sha256(key + nonce + struct.pack("!I", ctr)).digest()
+        ctr += 1
+    return out[:length]
+
+
+def _shared_key_bytes() -> bytes:
+    raw = os.getenv("UNDEAD_SHARED_KEY", "").strip()
+    if not raw:
+        return b""
+    try:
+        return bytes.fromhex(raw)
+    except Exception:
+        return raw.encode("utf-8", errors="ignore")
+
+
+def _derive_packet_keys(key_stream: bytes) -> tuple[bytes, bytes]:
+    seed = hashlib.sha256(key_stream + _shared_key_bytes()).digest()
+    enc_key = hashlib.sha256(seed + b"enc-v1").digest()
+    mac_key = hashlib.sha256(seed + b"mac-v1").digest()
+    return enc_key, mac_key
+
+
+def _secure_pack(payload: bytes, key_stream: bytes) -> bytes:
+    """
+    Packet format (v1):
+      [flags:1][nonce:8][ciphertext:N][tag:16]
+
+    flags bit0 = payload was zlib-compressed before encryption.
+    """
+    flags = 0
+    plain = payload
+    compressed = zlib.compress(payload, level=6)
+    if len(compressed) + 2 < len(payload):
+        plain = compressed
+        flags |= 0x01
+
+    nonce = os.urandom(8)
+    enc_key, mac_key = _derive_packet_keys(key_stream)
+    stream = _expand_stream(enc_key, nonce, len(plain))
+    cipher = _xor_bytes(plain, stream)
+    tag = hmac.new(mac_key, bytes([flags]) + nonce + cipher, hashlib.sha256).digest()[:16]
+    return bytes([flags]) + nonce + cipher + tag
+
+
+def _secure_unpack(packet: bytes, key_stream: bytes) -> bytes:
+    if len(packet) < 1 + 8 + 16:
+        return b""
+
+    flags = packet[0]
+    nonce = packet[1:9]
+    tag = packet[-16:]
+    cipher = packet[9:-16]
+
+    enc_key, mac_key = _derive_packet_keys(key_stream)
+    expected = hmac.new(mac_key, bytes([flags]) + nonce + cipher, hashlib.sha256).digest()[:16]
+    if not hmac.compare_digest(tag, expected):
+        return b""
+
+    stream = _expand_stream(enc_key, nonce, len(cipher))
+    plain = _xor_bytes(cipher, stream)
+    if flags & 0x01:
+        try:
+            plain = zlib.decompress(plain)
+        except Exception:
+            return b""
+    return plain
+
+
 # ─── Framing ────────────────────────────────────────────────────────────────
 
 def frame(data: bytes) -> bytes:
@@ -103,8 +181,9 @@ def encode_payload(
     without reusing the same XOR positions.
     """
     framed = frame(data)
-    pad    = (4 - len(framed) % 4) % 4
-    padded = framed + os.urandom(pad)                  # cryptographic random pad
+    secure = _secure_pack(framed, key_stream)
+    pad    = (4 - len(secure) % 4) % 4
+    padded = secure + os.urandom(pad)                  # cryptographic random pad
 
     scrambled = _xor32(padded, key_stream, block_offset)
     return [b32enc(scrambled[i : i + 4]) for i in range(0, len(scrambled), 4)]
@@ -142,7 +221,12 @@ def decode_labels(
         raw += b"\x00" * (4 - tail)
 
     plain = _xor32(bytes(raw), key_stream, block_offset)
-    return deframe(plain)
+    secure_plain = _secure_unpack(plain.rstrip(b"\x00"), key_stream)
+    if not secure_plain:
+        secure_plain = _secure_unpack(plain, key_stream)
+    if not secure_plain:
+        return b""
+    return deframe(secure_plain)
 
 
 # ─── NTP fixed-width encode/decode (20 covert bytes per packet) ────────────

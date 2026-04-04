@@ -14,7 +14,7 @@ Architecture
 • Per-response send delay: 30–80 ms to look like a real authoritative server.
 """
 
-import os, sys, time, random, struct, socket, threading, hashlib, base64, secrets
+import os, sys, time, random, struct, socket, threading, hashlib, base64, secrets, argparse
 from dataclasses  import dataclass, field
 from typing       import Dict, List, Optional, Tuple
 from tunnel_core  import (
@@ -24,6 +24,7 @@ from tunnel_core  import (
 
 # ─── config ──────────────────────────────────────────────────────────────────
 TUNNEL_DOMAIN       = "t.example.com"
+TUNNEL_DOMAINS      = [TUNNEL_DOMAIN]
 LISTEN_HOST         = "0.0.0.0"
 LISTEN_PORT         = 53
 UPSTREAM_HOST       = "127.0.0.1"
@@ -34,6 +35,12 @@ REPLY_DELAY_MS_MIN  = 30            # ms delay before sending each response
 REPLY_DELAY_MS_MAX  = 80
 REASSEMBLE_WAIT_S   = 0.5           # wait this long for straggler chunks
 MAX_SESSIONS        = 100
+UPLOAD_MTU          = 512
+DOWNLOAD_MTU        = 512
+ALLOWED_COVERT_QTYPES = {2, 16, 5, 15, 33}
+MAX_QUERY_BYTES     = 220
+MAX_QNAME_SIZE      = 253
+MAX_LABEL_SIZE      = 48
 
 
 # ─── record types ────────────────────────────────────────────────────────────
@@ -46,6 +53,46 @@ class RType:
     A     = 1
     AAAA  = 28
     NAMES = {2:"NS",5:"CNAME",15:"MX",16:"TXT",33:"SRV",1:"A",28:"AAAA"}
+
+
+def parse_qtypes(csv: str) -> set:
+    mapping = {
+        "NS": RType.NS,
+        "TXT": RType.TXT,
+        "CNAME": RType.CNAME,
+        "MX": RType.MX,
+        "SRV": RType.SRV,
+        "A": RType.A,
+        "AAAA": RType.AAAA,
+    }
+    out = set()
+    for raw in csv.split(","):
+        t = raw.strip().upper()
+        if t in mapping:
+            out.add(mapping[t])
+    return out
+
+
+def load_domains_file(path: str) -> List[str]:
+    out: List[str] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                value = line.strip()
+                if not value or value.startswith("#"):
+                    continue
+                out.append(value)
+    except Exception as e:
+        print(f"[SRV] domains file read error: {e}")
+    return out
+
+
+def _match_tunnel_domain(qname: str) -> Optional[Tuple[str, str]]:
+    for domain in TUNNEL_DOMAINS:
+        suffix = f".{domain}"
+        if qname.endswith(suffix):
+            return qname[: -len(suffix)], domain
+    return None
 
 
 # ─── DNS wire format helpers ─────────────────────────────────────────────────
@@ -164,10 +211,10 @@ def parse_covert_label(qname: str) -> Optional[Tuple[str, int, int, str]]:
 
     Returns (sid_hex, seq, total, b32_label) or None if not a covert query.
     """
-    suffix = f".{TUNNEL_DOMAIN}"
-    if not qname.endswith(suffix):
+    matched = _match_tunnel_domain(qname)
+    if not matched:
         return None
-    first = qname[: -len(suffix)]
+    first, _ = matched
 
     # format: <label>-<sid8><seq3><total3>
     # meta is always 8+3+3 = 14 hex chars at the end after the last '-'
@@ -176,6 +223,8 @@ def parse_covert_label(qname: str) -> Optional[Tuple[str, int, int, str]]:
         return None
     label = first[:dash]
     meta  = first[dash + 1:]
+    if len(label) > MAX_LABEL_SIZE:
+        return None
     if len(meta) != 14:
         return None
     try:
@@ -187,14 +236,14 @@ def parse_covert_label(qname: str) -> Optional[Tuple[str, int, int, str]]:
     except Exception:
         return None
 
-def is_reply_query(qname: str) -> Optional[str]:
-    """Return sid_hex if this is a reply-poll query, else None."""
-    suffix = f".{TUNNEL_DOMAIN}"
-    if not qname.endswith(suffix):
+def is_reply_query(qname: str) -> Optional[Tuple[str, str]]:
+    """Return (sid_hex, matched_domain) if this is a reply-poll query, else None."""
+    matched = _match_tunnel_domain(qname)
+    if not matched:
         return None
-    label = qname[: -len(suffix)]
+    label, matched_domain = matched
     if label.startswith("reply-") and len(label) > 6:
-        return label[6:]
+        return label[6:], matched_domain
     return None
 
 
@@ -318,15 +367,21 @@ def handle_query(query: bytes) -> bytes:
     Process one DNS query and return the response bytes.
     Called by both UDP and TCP handlers.
     """
+    if len(query) > min(MAX_QUERY_BYTES, UPLOAD_MTU):
+        return build_nxdomain(query)
+
     result = parse_question(query)
     if result is None:
         return build_nxdomain(query)
 
     qname, qtype, _ = result
+    if len(qname) > MAX_QNAME_SIZE:
+        return build_nxdomain(query)
 
     # ── Reply poll? ──
-    sid_hex = is_reply_query(qname)
-    if sid_hex:
+    sid_info = is_reply_query(qname)
+    if sid_info:
+        sid_hex, sid_domain = sid_info
         with _lock:
             sess = _sessions.get(sid_hex)
         _ms_delay()
@@ -336,13 +391,17 @@ def handle_query(query: bytes) -> bytes:
             ns_names = []
             for seq, lbl in enumerate(sess.reply_labels):
                 meta = f"{seq:03x}{sess.reply_total:03x}"
-                ns_names.append(f"{lbl}-{meta}.{TUNNEL_DOMAIN}")
+                ns_names.append(f"{lbl}-{meta}.{sid_domain}")
             return build_ns_response(query, ns_names)
         return build_nxdomain(query)
 
     # ── Covert payload? ──
     parsed = parse_covert_label(qname)
     if parsed:
+        if qtype not in ALLOWED_COVERT_QTYPES:
+            _ms_delay()
+            return build_nxdomain(query)
+
         sid_hex, seq, total, label = parsed
         rtype_name = RType.NAMES.get(qtype, f"TYPE{qtype}")
         print(f"[SRV] covert {rtype_name} sid={sid_hex} seq={seq}/{total}")
@@ -394,11 +453,11 @@ class UDPHandler(threading.Thread):
 
     def run(self):
         resp = handle_query(self.data)
-        # If response > 512 bytes, set TC flag and truncate to 512
-        if len(resp) > 512:
+        # If response > UDP MTU, set TC flag and truncate.
+        if len(resp) > DOWNLOAD_MTU:
             if len(resp) >= 4:
                 flags = struct.unpack_from("!H", resp, 2)[0] | 0x0200  # TC=1
-                resp = resp[:2] + struct.pack("!H", flags) + resp[4:512]
+                resp = resp[:2] + struct.pack("!H", flags) + resp[4:DOWNLOAD_MTU]
         try:
             self.sock.sendto(resp, self.addr)
         except Exception:
@@ -409,9 +468,10 @@ def run_udp_server():
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((LISTEN_HOST, LISTEN_PORT))
     print(f"[SRV] UDP/53 listening on {LISTEN_HOST}:{LISTEN_PORT}")
+    recv_limit = max(512, min(MAX_QUERY_BYTES, UPLOAD_MTU))
     while True:
         try:
-            data, addr = s.recvfrom(4096)
+            data, addr = s.recvfrom(recv_limit)
             UDPHandler(s, data, addr).start()
         except Exception as e:
             print(f"[SRV] UDP recv error: {e}")
@@ -502,6 +562,74 @@ def straggler_checker():
 # ─── entry point ─────────────────────────────────────────────────────────────
 
 def main():
+    global TUNNEL_DOMAIN, TUNNEL_DOMAINS, LISTEN_HOST, LISTEN_PORT, UPSTREAM_HOST, UPSTREAM_PORT
+    global UPSTREAM_PROTO, SESSION_TTL_S, REPLY_DELAY_MS_MIN, REPLY_DELAY_MS_MAX
+    global REASSEMBLE_WAIT_S, MAX_SESSIONS, UPLOAD_MTU, DOWNLOAD_MTU, ALLOWED_COVERT_QTYPES
+    global MAX_QUERY_BYTES, MAX_QNAME_SIZE, MAX_LABEL_SIZE
+
+    parser = argparse.ArgumentParser(description="DNS tunnel server")
+    parser.add_argument("--domain", default=TUNNEL_DOMAIN, help="Tunnel domain")
+    parser.add_argument("--domain-alias", action="append", default=[], help="Additional tunnel domain, repeatable")
+    parser.add_argument("--domains-file", default="", help="File with one domain per line")
+    parser.add_argument("--listen-host", default=LISTEN_HOST, help="Bind host")
+    parser.add_argument("--listen-port", type=int, default=LISTEN_PORT, help="Bind port")
+    parser.add_argument("--upstream-host", default=UPSTREAM_HOST, help="Upstream host")
+    parser.add_argument("--upstream-port", type=int, default=UPSTREAM_PORT, help="Upstream port")
+    parser.add_argument("--upstream-proto", choices=["tcp", "udp"], default=UPSTREAM_PROTO, help="Upstream protocol")
+    parser.add_argument("--session-ttl", type=float, default=SESSION_TTL_S, help="Session TTL seconds")
+    parser.add_argument("--max-sessions", type=int, default=MAX_SESSIONS, help="Max concurrent sessions")
+    parser.add_argument("--reassemble-wait", type=float, default=REASSEMBLE_WAIT_S, help="Straggler reassembly wait seconds")
+    parser.add_argument("--reply-delay-min", type=int, default=REPLY_DELAY_MS_MIN, help="Reply min delay ms")
+    parser.add_argument("--reply-delay-max", type=int, default=REPLY_DELAY_MS_MAX, help="Reply max delay ms")
+    parser.add_argument("--mtu", type=int, default=None, help="Set both upload and download MTU")
+    parser.add_argument("--upload-mtu", type=int, default=UPLOAD_MTU, help="Server upload MTU (incoming query path)")
+    parser.add_argument("--download-mtu", type=int, default=DOWNLOAD_MTU, help="Server download MTU (UDP response path)")
+    parser.add_argument("--max-query-bytes", type=int, default=MAX_QUERY_BYTES, help="Maximum incoming DNS query packet size")
+    parser.add_argument("--max-qname-size", type=int, default=MAX_QNAME_SIZE, help="Maximum DNS qname length")
+    parser.add_argument("--query-size", type=int, default=MAX_QUERY_BYTES, help="Maximum incoming DNS query packet size")
+    parser.add_argument("--max-label-size", type=int, default=MAX_LABEL_SIZE, help="Maximum covert label chars accepted")
+    parser.add_argument("--query-types", default="NS,TXT,CNAME,MX,SRV", help="Allowed covert query types CSV")
+    args = parser.parse_args()
+
+    TUNNEL_DOMAIN = args.domain.strip()
+    domain_list = [TUNNEL_DOMAIN]
+    for d in args.domain_alias:
+        value = d.strip()
+        if value:
+            domain_list.append(value)
+    if args.domains_file:
+        domain_list.extend(load_domains_file(args.domains_file))
+    dedup: List[str] = []
+    seen = set()
+    for d in domain_list:
+        if d and d not in seen:
+            dedup.append(d)
+            seen.add(d)
+    TUNNEL_DOMAINS = dedup if dedup else [TUNNEL_DOMAIN]
+    LISTEN_HOST = args.listen_host
+    LISTEN_PORT = args.listen_port
+    UPSTREAM_HOST = args.upstream_host
+    UPSTREAM_PORT = args.upstream_port
+    UPSTREAM_PROTO = args.upstream_proto
+    SESSION_TTL_S = max(5.0, args.session_ttl)
+    MAX_SESSIONS = min(max(1, args.max_sessions), 100)
+    REASSEMBLE_WAIT_S = max(0.05, args.reassemble_wait)
+    REPLY_DELAY_MS_MIN = max(0, args.reply_delay_min)
+    REPLY_DELAY_MS_MAX = max(REPLY_DELAY_MS_MIN, args.reply_delay_max)
+    if args.mtu is not None:
+        UPLOAD_MTU = max(128, args.mtu)
+        DOWNLOAD_MTU = max(128, args.mtu)
+    else:
+        UPLOAD_MTU = max(128, args.upload_mtu)
+        DOWNLOAD_MTU = max(128, args.download_mtu)
+    MAX_QUERY_BYTES = min(max(80, args.max_query_bytes), 512)
+    MAX_QNAME_SIZE = min(max(64, args.max_qname_size), 253)
+    MAX_QUERY_BYTES = min(MAX_QUERY_BYTES, min(max(80, args.query_size), 512))
+    MAX_LABEL_SIZE = min(max(7, args.max_label_size), 63)
+    ALLOWED_COVERT_QTYPES = parse_qtypes(args.query_types)
+    if not ALLOWED_COVERT_QTYPES:
+        ALLOWED_COVERT_QTYPES = {RType.NS, RType.TXT, RType.CNAME, RType.MX, RType.SRV}
+
     threading.Thread(target=cleanup_sessions,  daemon=True).start()
     threading.Thread(target=straggler_checker, daemon=True).start()
 
@@ -512,7 +640,10 @@ def main():
     tcp_thread.start()
 
     print(f"[SRV] Upstream: {UPSTREAM_PROTO}://{UPSTREAM_HOST}:{UPSTREAM_PORT}")
+    print(f"[SRV] Domains: {', '.join(TUNNEL_DOMAINS)}")
     print(f"[SRV] Max sessions: {MAX_SESSIONS}  TTL: {SESSION_TTL_S}s")
+    print(f"[SRV] MTU up={UPLOAD_MTU} down={DOWNLOAD_MTU}  Allowed covert qtypes: {[RType.NAMES.get(t, t) for t in sorted(ALLOWED_COVERT_QTYPES)]}")
+    print(f"[SRV] query limits: bytes={MAX_QUERY_BYTES} qname={MAX_QNAME_SIZE} label={MAX_LABEL_SIZE}")
     udp_thread.join()
     tcp_thread.join()
 

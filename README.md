@@ -1,40 +1,192 @@
-# Undead-Tunnel
+# Undead Tunnel
 
-A tunnel Idea for  lightless days, here is the road map
+A lightweight DNS/NTP tunneling project with:
 
+- DNS and NTP client/server pairs
+- Shared transport core (`tunnel_core.py`)
+- Resolver pooling and parallel send paths
+- Optional local proxy mode on client side
+- Simple unified CLI and Linux installer
 
-<img width="612" height="1280" alt="image" src="https://github.com/user-attachments/assets/2e6d69e4-dc71-47d3-90fe-8230d706a110" />
+<img width="612" height="1280" alt="project-diagram" src="https://github.com/user-attachments/assets/2e6d69e4-dc71-47d3-90fe-8230d706a110" />
 
+---
 
+## Project Files
 
+- `tunnel_core.py` — shared encode/decode pipeline used by DNS/NTP
+- `dns_tunnel_client.py` — DNS tunnel client
+- `dns_tunnel_server.py` — DNS tunnel server
+- `ntp_tunnel_client.py` — NTP tunnel client
+- `ntp_tunnel_server.py` — NTP tunnel server
+- `undead_cli.py` — simple launcher for client/server
+- `install_linux.sh` — Linux setup helper
+- `undead_client_config.json` — editable client config template
+- `undead_server_config.json` — editable server config template
 
+---
 
+## Core Design Notes
 
+### `tunnel_core.py`
 
+- Uses a 32-bit block transport path for label-safe tunneling.
+- Includes framing/deframing to preserve original payload boundaries.
+- Adds optional compression when beneficial before transport packing.
+- Adds authenticated encryption layer (via shared key env support).
 
+### `dns_tunnel_client.py`
 
-tunnel_core.py — symmetric encode/decode engine : 
-                   encode_payload() and decode_labels() are now fully symmetric — both sides use the same _xor32() function with the same block_offset. ntp_encode_chunk() and ntp_decode_chunk() are identical under the hood because XOR is its own inverse. The block_offset parameter advances across bursts so the TX           key positions never overlap with RX key positions, preventing any XOR collision between a sent payload and its reply.
+- Splits payload across covert DNS record types.
+- Keeps vital chunks prioritized on `NS`.
+- Supports resolver lists, channels, duplication, and parallel sends.
+- Supports separate upload/download MTU and query-size limits.
+- Supports local proxy mode (`socks` or `http`).
 
+### `dns_tunnel_server.py`
 
+- Listens on both UDP and TCP DNS paths.
+- Enforces query/label/MTU safety limits.
+- Handles session assembly and reply chunking.
+- Supports configurable query types and session bounds.
 
-dns_tunnel_client.py :
-   NS records now carry ~60% of the labels (the vital primary data). TXT/CNAME/MX/SRV share the remaining 40% as supporting shards. Every covert query name uses the format <b32data>-<sid8hex><seq3hex><total3hex>.<domain> — the first component looks like a real hostname label to any resolver. Decoy A/AAAA queries   (30% ratio) are interleaved with covert ones. The resolver pool is ResolverPool — weighted round-robin across up to 100 entries, with failure tracking that reduces a bad resolver's probability. Every send_query() call applies a 20–120 ms uniform random delay before the send, and automatically retries via TCP/53   if UDP times out or the response has TC=1 set.
+---
 
+## Simple CLI (`undead_cli.py`)
 
+Run server:
 
-dns_tunnel_server.py:
+```bash
+python3 undead_cli.py server --domain t.example.com --upstream-host 127.0.0.1 --upstream-port 8080
+```
 
- Runs two listeners in parallel threads: run_udp_server() for UDP/53 and run_tcp_server() for TCP/53. The TCP handler implements the RFC 1035 §4.2.2 two-byte length-prefix framing. Reply chunks are returned as NS RDATA entries (<b32label>-<seq3hex><total3hex>.<domain>) — the same format the client parses in 
- receive_reply(). A background straggler_checker thread force-completes sessions that stopped receiving chunks after REASSEMBLE_WAIT_S seconds, handling packet loss gracefully. Per-response delays of 30–80 ms mimic real authoritative server latency.
+Add multiple domains on server:
 
- 
+```bash
+python3 undead_cli.py server --domain t.example.com --domain-alias a.example.com --domain-alias b.example.com
+```
 
-ntp_tunnel_client.py: 
+Or load domains from file (one domain per line):
 
-   send_payload() now returns (session, responses) — the list of server responses collected during the burst. decode_replies() is a proper receive-path function that extracts the server's covert reply from those responses (or polls with bare NTP packets for any that didn't arrive), calls ntp_decode_chunk() per      packet, unpacks the resulting plaintext blocks, and deframe()s the result. The NTP server pool mirrors the DNS resolver pool. UDP/123 is tried first; _send_tcp_ntp() provides TCP/123 fallback with 2-byte length framing. Per-packet send delay is 5–30 ms uniform random.
+```bash
+python3 undead_cli.py server --domain t.example.com --domains-file domains.txt
+```
 
+Run client (SOCKS proxy):
 
-ntp_tunnel_server.py:
+```bash
+python3 undead_cli.py client --domain t.example.com --resolver 1.1.1.1 --proxy-mode socks --proxy-port 1080
+```
 
-   CovertSession.decode_rx() implements the full 32-bit receive-path decode: for each collected 20-byte chunk it calls ntp_decode_chunk() at the correct block_offset, unpacks 5 × 4-byte plaintext blocks, reassembles, and deframe()s. CovertSession.encode_reply() implements the full 32-bit send-path encode: calls     encode_payload() at tx_block_off (which starts past all RX label positions), packs groups of 5 labels into 20-byte chunks, and calls ntp_encode_chunk() per packet. Both paths use tx_block_off and rx_block_off separately so the key stream is never reused between directions.
+CLI behavior:
+
+- Prints launch command and final status (`success` or `failed`).
+- Prints proxy endpoint in proxy mode.
+
+---
+
+## Server Setup Export (Key + Client Import Config)
+
+Generate setup from server side:
+
+```bash
+python3 undead_cli.py server --setup --setup-output undead_client_import.json --domain t.example.com
+```
+
+Use generated import config on client:
+
+```bash
+python3 undead_cli.py client --import-config undead_client_import.json --resolver 1.1.1.1
+```
+
+Optional key override:
+
+```bash
+python3 undead_cli.py client --shared-key <hex_or_text_key> ...
+```
+
+---
+
+## Easy Settings Management (JSON)
+
+You can edit settings (MTU, query size, resolvers, proxy, etc.) without touching code.
+
+Use provided templates:
+
+- `undead_client_config.json`
+- `undead_server_config.json`
+
+Run with config:
+
+```bash
+python3 undead_cli.py client --config undead_client_config.json
+python3 undead_cli.py server --config undead_server_config.json
+```
+
+Print effective config (without running):
+
+```bash
+python3 undead_cli.py client --config undead_client_config.json --print-config
+python3 undead_cli.py server --config undead_server_config.json --print-config
+```
+
+Write current flags into a config file:
+
+```bash
+python3 undead_cli.py client --upload-mtu 220 --query-size 220 --write-config my_client.json
+python3 undead_cli.py server --upload-mtu 220 --query-size 220 --write-config my_server.json
+```
+
+---
+
+## Linux Install
+
+Install helper:
+
+```bash
+bash install_linux.sh
+```
+
+What it does:
+
+- Creates `.venv`
+- Installs launchers into `$HOME/.local/bin` (or `INSTALL_DIR`):
+  - `undead-client`
+  - `undead-server`
+
+Then use:
+
+```bash
+undead-server --domain t.example.com --upstream-host 127.0.0.1 --upstream-port 8080
+undead-client --domain t.example.com --resolver 1.1.1.1 --proxy-mode socks --proxy-port 1080
+```
+
+### Full server deployment (systemd)
+
+Use deploy helper:
+
+```bash
+sudo bash deploy_server_linux.sh
+```
+
+Useful environment overrides:
+
+```bash
+sudo APP_USER=ubuntu DOMAIN=t.example.com DOMAIN_ALIASES="a.example.com,b.example.com" \
+UPSTREAM_HOST=127.0.0.1 UPSTREAM_PORT=8080 bash deploy_server_linux.sh
+```
+
+This script:
+
+- installs launchers for the target user
+- writes server config to `/etc/undead-tunnel/server.json`
+- creates `systemd` service (`undead-tunnel.service` by default)
+- enables and starts the service
+
+---
+
+## Notes
+
+- Keep DNS query size conservative for stability on public resolvers.
+- Compression helps only for compressible payloads.
+- Proxy mode is intended for local app integration through the tunnel runtime.
