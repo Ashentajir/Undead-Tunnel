@@ -1,0 +1,44 @@
+# Secrets and environment
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets.*
+
+# Local data and databases
+*.db
+*.sqlite
+*.sqlite3
+*.csv
+*.tsv
+*.jsonl
+data/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.swp
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
