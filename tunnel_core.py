@@ -115,7 +115,8 @@ def _secure_pack(payload: bytes, key_stream: bytes) -> bytes:
     enc_key, mac_key = _derive_packet_keys(key_stream)
     stream = _expand_stream(enc_key, nonce, len(plain))
     cipher = _xor_bytes(plain, stream)
-    tag = hmac.new(mac_key, bytes([flags]) + nonce + cipher, hashlib.sha256).digest()[:16]
+    auth_body = bytes([flags]) + nonce + cipher
+    tag = hmac.new(mac_key, auth_body, hashlib.sha256).digest()[:16]
     return bytes([flags]) + nonce + cipher + tag
 
 
@@ -129,7 +130,8 @@ def _secure_unpack(packet: bytes, key_stream: bytes) -> bytes:
     cipher = packet[9:-16]
 
     enc_key, mac_key = _derive_packet_keys(key_stream)
-    expected = hmac.new(mac_key, bytes([flags]) + nonce + cipher, hashlib.sha256).digest()[:16]
+    auth_body = bytes([flags]) + nonce + cipher
+    expected = hmac.new(mac_key, auth_body, hashlib.sha256).digest()[:16]
     if not hmac.compare_digest(tag, expected):
         return b""
 
@@ -180,10 +182,10 @@ def encode_payload(
     `block_offset` lets multi-burst sessions advance through the key stream
     without reusing the same XOR positions.
     """
-    framed = frame(data)
-    secure = _secure_pack(framed, key_stream)
-    pad    = (4 - len(secure) % 4) % 4
-    padded = secure + os.urandom(pad)                  # cryptographic random pad
+    secure = _secure_pack(data, key_stream)
+    framed = frame(secure)
+    pad    = (4 - len(framed) % 4) % 4
+    padded = framed + os.urandom(pad)                  # cryptographic random pad
 
     scrambled = _xor32(padded, key_stream, block_offset)
     return [b32enc(scrambled[i : i + 4]) for i in range(0, len(scrambled), 4)]
@@ -221,12 +223,13 @@ def decode_labels(
         raw += b"\x00" * (4 - tail)
 
     plain = _xor32(bytes(raw), key_stream, block_offset)
-    secure_plain = _secure_unpack(plain.rstrip(b"\x00"), key_stream)
-    if not secure_plain:
-        secure_plain = _secure_unpack(plain, key_stream)
-    if not secure_plain:
+    secured = deframe(plain)
+    if not secured:
         return b""
-    return deframe(secure_plain)
+    unpacked = _secure_unpack(secured, key_stream)
+    if not unpacked:
+        return b""
+    return unpacked
 
 
 # ─── NTP fixed-width encode/decode (20 covert bytes per packet) ────────────

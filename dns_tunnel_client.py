@@ -364,7 +364,8 @@ def send_query(
 class TunnelSession:
     session_id:   bytes = field(default_factory=lambda: secrets.token_bytes(6))
     key_stream:   bytes = field(init=False)
-    block_offset: int   = 0         # advances across bursts so key never repeats
+    block_offset: int   = 0         # TX block offset
+    reply_offset: int   = 0         # RX reply decode offset for latest burst
 
     def __post_init__(self):
         self.key_stream = derive_key_stream(self.session_id, 8192)
@@ -462,9 +463,11 @@ def send_payload(
         session = TunnelSession()
 
     # 32-bit encode for TX
-    labels = encode_payload(data, session.key_stream, session.block_offset)
+    tx_start = session.block_offset
+    labels = encode_payload(data, session.key_stream, tx_start)
     n      = len(labels)
     session.block_offset += n
+    session.reply_offset = tx_start + n
 
     sid    = session.sid_hex
     total  = n
@@ -480,6 +483,9 @@ def send_payload(
     if RType.NS in ordered_types:
         other_types = [t for t in ordered_types if t != RType.NS]
         vital_ns = min(n, max(1, (n * 3) // 5))
+        # Keep at least one slot per non-NS type when chunks allow.
+        if other_types and n > len(other_types):
+            vital_ns = min(vital_ns, n - len(other_types))
         type_plan.extend([RType.NS] * vital_ns)
         remain = n - vital_ns
 
@@ -654,7 +660,10 @@ def receive_reply(
         return None
 
     ordered = [collected[k] for k in sorted(collected.keys())]
-    return decode_labels(ordered, session.key_stream, session.block_offset)
+    decoded = decode_labels(ordered, session.key_stream, session.reply_offset)
+    if decoded:
+        session.block_offset = max(session.block_offset, session.reply_offset + len(ordered))
+    return decoded
 
 
 def parse_resolver_entry(value: str) -> Optional[Tuple[str, int]]:
